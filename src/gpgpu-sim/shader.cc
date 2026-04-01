@@ -191,8 +191,11 @@ void shader_core_ctx::create_schedulers() {
   // scedulers
   // must currently occur after all inputs have been initialized.
   std::string sched_config = m_config->gpgpu_scheduler_string;
+
   const concrete_scheduler scheduler =
-      sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
+      sched_config.find("two_level_rr") != std::string::npos
+          ? CONCRETE_SCHEDULER_TWO_LEVEL_RR
+      : sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
       : sched_config.find("two_level_active") != std::string::npos
           ? CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE
       : sched_config.find("gto") != std::string::npos ? CONCRETE_SCHEDULER_GTO
@@ -203,6 +206,19 @@ void shader_core_ctx::create_schedulers() {
           ? CONCRETE_SCHEDULER_WARP_LIMITING
           : NUM_CONCRETE_SCHEDULERS;
   assert(scheduler != NUM_CONCRETE_SCHEDULERS);
+
+  //  const concrete_scheduler scheduler =
+  //     sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
+  //   : sched_config.find("two_level_active") != std::string::npos
+  //      ? CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE
+  //: sched_config.find("gto") != std::string::npos ? CONCRETE_SCHEDULER_GTO
+  //: sched_config.find("rrr") != std::string::npos ? CONCRETE_SCHEDULER_RRR
+  //: sched_config.find("old") != std::string::npos
+  //  ? CONCRETE_SCHEDULER_OLDEST_FIRST
+  //: sched_config.find("warp_limiting") != std::string::npos
+  //  ? CONCRETE_SCHEDULER_WARP_LIMITING
+  //: NUM_CONCRETE_SCHEDULERS;
+  // assert(scheduler != NUM_CONCRETE_SCHEDULERS);
 
   for (unsigned i = 0; i < m_config->gpgpu_num_sched_per_core; i++) {
     switch (scheduler) {
@@ -254,8 +270,27 @@ void shader_core_ctx::create_schedulers() {
             &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
             &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
         break;
+      case CONCRETE_SCHEDULER_TWO_LEVEL_RR:
+        schedulers.push_back(new two_level_rr_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
+        break;
       default:
         abort();
+        //      case CONCRETE_SCHEDULER_WARP_LIMITING:
+        //        schedulers.push_back(new swl_scheduler(
+        //            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+        //            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+        //            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+        //            &m_pipeline_reg[ID_OC_TENSOR_CORE],
+        //            m_specilized_dispatch_reg, &m_pipeline_reg[ID_OC_MEM], i,
+        //            m_config->gpgpu_scheduler_string));
+        //        break;
+        //      default:
+        //        abort();
     };
   }
 
@@ -1674,6 +1709,46 @@ void two_level_active_scheduler::order_warps() {
     abort();
   }
   assert(num_promoted == num_demoted);
+}
+
+void two_level_rr_scheduler::order_warps() {
+  unsigned num_warps = m_supervised_warps.size();
+  if (num_warps == 0) return;
+
+  unsigned num_groups =
+      (num_warps + m_fetch_group_size - 1) / m_fetch_group_size;
+
+  // Switch fetch group if current one is fully stalled
+  if (fetch_group_all_stalled(m_current_fetch_group)) {
+    for (unsigned i = 1; i <= num_groups; i++) {
+      unsigned candidate = (m_current_fetch_group + i) % num_groups;
+      if (!fetch_group_all_stalled(candidate)) {
+        m_current_fetch_group = candidate;
+        break;
+      }
+    }
+  }
+
+  // Build prioritized warp list: current fetch group first (RR within),
+  // then remaining groups appended in order
+  m_next_cycle_prioritized_warps.clear();
+
+  for (unsigned g = 0; g < num_groups; g++) {
+    unsigned group_id = (m_current_fetch_group + g) % num_groups;
+    unsigned start = group_id * m_fetch_group_size;
+    unsigned end = std::min(num_warps, start + m_fetch_group_size);
+
+    std::vector<shd_warp_t *> group_warps(m_supervised_warps.begin() + start,
+                                          m_supervised_warps.begin() + end);
+
+    std::vector<shd_warp_t *> ordered_group;
+    order_lrr(ordered_group, group_warps, group_warps.end(),
+              group_warps.size());
+
+    for (auto *w : ordered_group) {
+      m_next_cycle_prioritized_warps.push_back(w);
+    }
+  }
 }
 
 swl_scheduler::swl_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
