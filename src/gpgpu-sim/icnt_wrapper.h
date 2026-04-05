@@ -61,6 +61,8 @@ extern icnt_display_state_p icnt_display_state;
 extern icnt_get_flit_size_p icnt_get_flit_size;
 extern unsigned g_network_mode;
 
+extern unsigned long long my_coalesced_flit_counter;
+
 enum network_mode { INTERSIM = 1, LOCAL_XBAR = 2, N_NETWORK_MODE };
 
 void icnt_wrapper_init();

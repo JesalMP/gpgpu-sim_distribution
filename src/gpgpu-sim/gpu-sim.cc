@@ -85,6 +85,8 @@ class gpgpu_sim_wrapper {};
 
 bool g_interactive_debugger_enabled = false;
 
+unsigned long long my_coalesced_flit_counter = 0;
+
 tr1_hash_map<new_addr_type, unsigned> address_random_interleaving;
 
 /* Clock Domains */
@@ -1270,6 +1272,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
         "----------\n");
     icnt_display_stats();
     icnt_display_overall_stats();
+    printf("icc_flits_saved = %llu\n", my_coalesced_flit_counter);
     printf(
         "----------------------------END-of-Interconnect-DETAILS---------------"
         "----------\n");
@@ -2097,7 +2100,7 @@ void gpgpu_sim::cycle() {
 
     if (g_interactive_debugger_enabled) gpgpu_debug();
 
-      // McPAT main cycle (interface with McPAT)
+    // McPAT main cycle (interface with McPAT)
 #ifdef GPGPUSIM_POWER_MODEL
     if (m_config.g_power_simulation_enabled) {
       if (m_config.g_power_simulation_mode == 0) {
@@ -2344,7 +2347,7 @@ void sst_gpgpu_sim::SST_cycle() {
   gpu_sim_cycle++;
   if (g_interactive_debugger_enabled) gpgpu_debug();
 
-    // McPAT main cycle (interface with McPAT)
+  // McPAT main cycle (interface with McPAT)
 #ifdef GPGPUSIM_POWER_MODEL
   if (m_config.g_power_simulation_enabled) {
     mcpat_cycle(m_config, getShaderCoreConfig(), m_gpgpusim_wrapper,
