@@ -3403,8 +3403,7 @@ void ldst_unit::print(FILE *fout) const {
       m_last_inst_gpu_sim_cycle, m_last_inst_gpu_tot_sim_cycle);
   fprintf(fout, "Pending register writes:\n");
   std::map<unsigned /*warp_id*/,
-           std::map<unsigned /*regnum*/, unsigned /*count*/> >::const_iterator
-      w;
+           std::map<unsigned /*regnum*/, unsigned /*count*/>>::const_iterator w;
   for (w = m_pending_writes.begin(); w != m_pending_writes.end(); w++) {
     unsigned warp_id = w->first;
     const std::map<unsigned /*regnum*/, unsigned /*count*/> &warp_info =
@@ -4612,28 +4611,72 @@ bool sst_simt_core_cluster::SST_injection_buffer_full(unsigned size, bool write,
   }
 }
 
-void simt_core_cluster::icnt_inject_request_packet(class mem_fetch *mf) {
-  // Update stats based on mf type
-  update_icnt_stats(mf);
+// Maps leader mf ptr → list of merged (waiting) mf ptrs
+std::unordered_map<mem_fetch *, std::vector<mem_fetch *>> m_icc_waiters;
 
-  // The packet size varies depending on the type of request:
-  // - For write request and atomic request, the packet contains the data
-  // - For read request (i.e. not write nor atomic), the packet only has control
-  // metadata
-  unsigned int packet_size = mf->size();
-  if (!mf->get_is_write() && !mf->isatomic()) {
-    packet_size = mf->get_ctrl_size();
+bool simt_core_cluster::icc_try_merge(mem_fetch *mf) {
+  new_addr_type block_addr = icc_block_addr(mf->get_addr());
+  auto it = m_icc_buffer.find(block_addr);
+  if (it == m_icc_buffer.end()) return false;
+  // Found a pending request for the same cache line
+  mem_fetch *leader = it->second;
+  leader->add_merged_requester(mf->get_sid(), mf->get_wid());
+  // Free the redundant mem_fetch (the leader will carry the reply)
+  // But keep a back-pointer so the reply can be delivered
+  // We need to store the full mf for the return-path fan-out
+  // so instead of freeing, store it in a side table keyed by leader
+  m_icc_waiters[leader].push_back(mf);
+  return true;
+}
+
+
+void simt_core_cluster::icc_fanout_reply(mem_fetch *leader) {
+  auto it = m_icc_waiters.find(leader);
+  if (it == m_icc_waiters.end()) return;
+
+  for (mem_fetch *waiter : it->second) {
+    // Clone the reply data into the waiter's mf
+    // (the waiter mf tracks the original requesting SM/warp)
+    waiter->set_reply();
+    waiter->set_status(IN_CLUSTER_TO_SHADER_QUEUE,
+                       m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+    // Inject directly into response fifo (bypass NoC)
+    m_response_fifo.push_back(waiter);
+    m_stats->icc_fanouts++;
   }
+  m_icc_waiters.erase(it);
+}
+
+new_addr_type simt_core_cluster::icc_block_addr(new_addr_type addr) const {
+  // Align to cache line size (128 bytes on V100)
+  unsigned line_sz = m_config->m_L1D_config.get_line_sz(); // or hardcode 128
+  return (addr / line_sz) * line_sz;
+}
+
+extern unsigned long long my_coalesced_flit_counter;
+
+void simt_core_cluster::icnt_inject_request_packet(class mem_fetch *mf) {
+  // Only coalesce read requests (not writes, not atomics)
+  if (m_config->icc_enabled && !mf->get_is_write() && !mf->isatomic()) {
+    if (icc_try_merge(mf)) {
+      // Merged into existing in-flight request; don't inject to NoC
+      m_stats->icc_merges++;  // new stat counter
+      my_coalesced_flit_counter += mf->get_ctrl_size(); // Approximate saved flits
+      return;
+    }
+    // No match — add to ICCB as new entry, then inject
+    new_addr_type block_addr = icc_block_addr(mf->get_addr());
+    m_icc_buffer[block_addr] = mf;
+  }
+  // Original injection path (unchanged)
+  update_icnt_stats(mf);
+  unsigned int packet_size = mf->get_ctrl_size();  // reads: ctrl only
   m_stats->m_outgoing_traffic_stats->record_traffic(mf, packet_size);
   unsigned destination = mf->get_sub_partition_id();
   mf->set_status(IN_ICNT_TO_MEM,
                  m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-  if (!mf->get_is_write() && !mf->isatomic())
-    ::icnt_push(m_cluster_id, m_config->mem2device(destination), (void *)mf,
-                mf->get_ctrl_size());
-  else
-    ::icnt_push(m_cluster_id, m_config->mem2device(destination), (void *)mf,
-                mf->size());
+  ::icnt_push(m_cluster_id, m_config->mem2device(destination), (void *)mf,
+              mf->get_ctrl_size());
 }
 
 void simt_core_cluster::update_icnt_stats(class mem_fetch *mf) {
@@ -4742,6 +4785,15 @@ void simt_core_cluster::icnt_cycle() {
     if (!mf) return;
     assert(mf->get_tpc() == m_cluster_id);
     assert(mf->get_type() == READ_REPLY || mf->get_type() == WRITE_ACK);
+
+    // ICC: remove from ICCB now that reply has arrived
+    if (m_config->icc_enabled) {
+      new_addr_type block_addr = icc_block_addr(mf->get_addr());
+      m_icc_buffer.erase(block_addr);
+
+      // Fan-out to merged waiters
+      icc_fanout_reply(mf);
+    }
 
     // The packet size varies depending on the type of request:
     // - For read request and atomic request, the packet contains the data

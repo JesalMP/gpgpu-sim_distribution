@@ -130,6 +130,17 @@ class mem_fetch {
   mem_fetch *get_original_mf() { return original_mf; }
   mem_fetch *get_original_wr_mf() { return original_wr_mf; }
 
+  // ICC - For tracking merged requests
+  std::vector<std::pair<unsigned, unsigned>> m_merged_requesters;
+  void add_merged_requester(unsigned sid, unsigned wid) {
+    m_merged_requesters.push_back({sid, wid});
+  }
+  bool has_merged_requesters() const { return !m_merged_requesters.empty(); }
+  const std::vector<std::pair<unsigned, unsigned>> &get_merged_requesters()
+      const {
+    return m_merged_requesters;
+  }
+
  private:
   // request source information
   unsigned m_request_uid;

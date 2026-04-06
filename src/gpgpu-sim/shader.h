@@ -274,9 +274,7 @@ class shd_warp_t {
   unsigned get_dynamic_warp_id() const { return m_dynamic_warp_id; }
   unsigned get_warp_id() const { return m_warp_id; }
 
-  class shader_core_ctx *get_shader() {
-    return m_shader;
-  }
+  class shader_core_ctx *get_shader() { return m_shader; }
 
  private:
   static const unsigned IBUFFER_SIZE = 2;
@@ -1639,6 +1637,9 @@ class shader_core_config : public core_config {
   mutable cache_config m_L1C_config;
   mutable l1d_cache_config m_L1D_config;
 
+  bool icc_enabled;
+  unsigned icc_buffer_size;
+
   bool gpgpu_dwf_reg_bankconflict;
 
   unsigned gpgpu_num_sched_per_core;
@@ -1817,6 +1818,9 @@ struct shader_core_stats_pod {
   unsigned *gpgpu_n_shmem_bank_access;
   long *n_simt_to_mem;  // Interconnect power stats
   long *n_mem_to_simt;
+
+  unsigned long long icc_merges;
+  unsigned long long icc_fanouts;
 };
 
 class shader_core_stats : public shader_core_stats_pod {
@@ -2672,6 +2676,20 @@ class simt_core_cluster {
   unsigned m_cta_issue_next_core;
   std::list<unsigned> m_core_sim_order;
   std::list<mem_fetch *> m_response_fifo;
+
+  // --- ICC: Intra-Cluster Coalescing Buffer ---
+  // Maps cache-line address → pending outbound mem_fetch
+  // (only READ_REQUEST entries; writes are not coalesced)
+  std::unordered_map<new_addr_type, mem_fetch *> m_icc_buffer;
+  // Returns the cache-line aligned address (block address)
+  new_addr_type icc_block_addr(new_addr_type addr) const;
+  // Try to merge mf into ICCB. Returns true if merged (don't inject to NoC).
+  // Returns false if no match or write request (inject normally).
+  bool icc_try_merge(mem_fetch *mf);
+  // Called when a reply arrives: fan out to all merged requesters
+  void icc_fanout_reply(mem_fetch *mf);
+  // Remove entry from ICCB when packet departs to NoC
+  void icc_mark_inflight(new_addr_type addr);
 };
 
 class exec_simt_core_cluster : public simt_core_cluster {
