@@ -192,7 +192,17 @@ void shader_core_ctx::create_schedulers() {
   // must currently occur after all inputs have been initialized.
   std::string sched_config = m_config->gpgpu_scheduler_string;
   const concrete_scheduler scheduler =
-      sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
+      sched_config.find("two_level_gto") != std::string::npos
+          ? CONCRETE_SCHEDULER_TWO_LEVEL_GTO
+      : sched_config.find("two_level_rr") != std::string::npos
+          ? CONCRETE_SCHEDULER_TWO_LEVEL_RR
+      : sched_config.find("lwm_two_level_adaptive") != std::string::npos
+          ? CONCRETE_SCHEDULER_LWM_TWO_LEVEL_ADAPTIVE
+      : sched_config.find("lwm_two_level") != std::string::npos
+          ? CONCRETE_SCHEDULER_LWM_TWO_LEVEL
+      : sched_config.find("lwm") != std::string::npos
+          ? CONCRETE_SCHEDULER_LWM
+      : sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
       : sched_config.find("two_level_active") != std::string::npos
           ? CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE
       : sched_config.find("gto") != std::string::npos ? CONCRETE_SCHEDULER_GTO
@@ -248,6 +258,46 @@ void shader_core_ctx::create_schedulers() {
         break;
       case CONCRETE_SCHEDULER_WARP_LIMITING:
         schedulers.push_back(new swl_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
+        break;
+      case CONCRETE_SCHEDULER_TWO_LEVEL_RR:
+        schedulers.push_back(new two_level_rr_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
+        break;
+      case CONCRETE_SCHEDULER_LWM:
+        schedulers.push_back(new lwm_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
+        break;
+      case CONCRETE_SCHEDULER_LWM_TWO_LEVEL:
+        schedulers.push_back(new lwm_two_level_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
+        break;
+      case CONCRETE_SCHEDULER_LWM_TWO_LEVEL_ADAPTIVE:
+        schedulers.push_back(new lwm_two_level_adaptive_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
+        break;
+      case CONCRETE_SCHEDULER_TWO_LEVEL_GTO:
+        schedulers.push_back(new two_level_gto_scheduler(
             m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
             &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
             &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
@@ -1707,6 +1757,290 @@ void swl_scheduler::order_warps() {
   } else {
     fprintf(stderr, "swl_scheduler m_prioritization = %d\n", m_prioritization);
     abort();
+  }
+}
+
+void two_level_rr_scheduler::order_warps() {
+  unsigned num_warps = m_supervised_warps.size();
+  if (num_warps == 0) return;
+
+  unsigned num_groups =
+      (num_warps + m_fetch_group_size - 1) / m_fetch_group_size;
+
+  if (fetch_group_all_stalled(m_current_fetch_group)) {
+    for (unsigned i = 1; i <= num_groups; i++) {
+      unsigned candidate = (m_current_fetch_group + i) % num_groups;
+      if (!fetch_group_all_stalled(candidate)) {
+        m_current_fetch_group = candidate;
+        break;
+      }
+    }
+  }
+
+  m_next_cycle_prioritized_warps.clear();
+
+  for (unsigned g = 0; g < num_groups; g++) {
+    unsigned group_id = (m_current_fetch_group + g) % num_groups;
+    unsigned start = group_id * m_fetch_group_size;
+    unsigned end = std::min(num_warps, start + m_fetch_group_size);
+
+    std::vector<shd_warp_t *> group_warps(
+        m_supervised_warps.begin() + start,
+        m_supervised_warps.begin() + end);
+
+    std::vector<shd_warp_t *> ordered_group;
+    order_lrr(ordered_group, group_warps, group_warps.end(), group_warps.size());
+
+    for (auto *w : ordered_group)
+      m_next_cycle_prioritized_warps.push_back(w);
+  }
+}
+
+void lwm_scheduler::order_warps() {
+  unsigned num_warps = m_supervised_warps.size();
+  if (num_warps == 0) return;
+
+  unsigned num_large_warps =
+      (num_warps + m_warps_per_large_warp - 1) / m_warps_per_large_warp;
+
+  if (large_warp_all_stalled(m_current_large_warp)) {
+    for (unsigned i = 1; i <= num_large_warps; i++) {
+      unsigned candidate = (m_current_large_warp + i) % num_large_warps;
+      if (!large_warp_all_stalled(candidate)) {
+        m_current_large_warp = candidate;
+        break;
+      }
+    }
+  }
+
+  m_next_cycle_prioritized_warps.clear();
+
+  unsigned start = m_current_large_warp * m_warps_per_large_warp;
+  unsigned end = std::min(num_warps, start + m_warps_per_large_warp);
+
+  std::vector<shd_warp_t *> current_large_warp_warps(
+      m_supervised_warps.begin() + start,
+      m_supervised_warps.begin() + end);
+
+  auto lwm_active_count = [](shd_warp_t *w) -> unsigned {
+    if (w->done_exit() || w->waiting()) return 0;
+    if (w->ibuffer_next_valid() && w->ibuffer_next_inst())
+      return w->ibuffer_next_inst()->active_count();
+    return MAX_WARP_SIZE;
+  };
+  std::sort(current_large_warp_warps.begin(), current_large_warp_warps.end(),
+            [&lwm_active_count](shd_warp_t *a, shd_warp_t *b) {
+              return lwm_active_count(a) > lwm_active_count(b);
+            });
+
+  for (auto *w : current_large_warp_warps)
+    m_next_cycle_prioritized_warps.push_back(w);
+
+  for (unsigned g = 1; g < num_large_warps; g++) {
+    unsigned group_id = (m_current_large_warp + g) % num_large_warps;
+    unsigned s = group_id * m_warps_per_large_warp;
+    unsigned e = std::min(num_warps, s + m_warps_per_large_warp);
+    std::vector<shd_warp_t *> group_warps(m_supervised_warps.begin() + s,
+                                          m_supervised_warps.begin() + e);
+    std::vector<shd_warp_t *> ordered_group;
+    order_lrr(ordered_group, group_warps, group_warps.end(), group_warps.size());
+    for (auto *w : ordered_group)
+      m_next_cycle_prioritized_warps.push_back(w);
+  }
+}
+
+void lwm_two_level_scheduler::order_warps() {
+  unsigned num_warps = m_supervised_warps.size();
+  if (num_warps == 0) return;
+
+  unsigned num_groups =
+      (num_warps + m_warps_per_group - 1) / m_warps_per_group;
+
+  auto lwm_active_count = [](shd_warp_t *w) -> unsigned {
+    if (w->done_exit() || w->waiting()) return 0;
+    if (w->ibuffer_next_valid() && w->ibuffer_next_inst())
+      return w->ibuffer_next_inst()->active_count();
+    return MAX_WARP_SIZE;
+  };
+
+  auto group_active_sum = [&](unsigned group_id) -> unsigned {
+    unsigned s = group_id * m_warps_per_group;
+    unsigned e = std::min(num_warps, s + m_warps_per_group);
+    unsigned sum = 0;
+    for (unsigned i = s; i < e; i++) sum += lwm_active_count(m_supervised_warps[i]);
+    return sum;
+  };
+
+  if (group_all_stalled(m_current_fetch_group)) {
+    unsigned best_group = m_current_fetch_group;
+    unsigned best_sum = 0;
+    for (unsigned i = 1; i <= num_groups; i++) {
+      unsigned candidate = (m_current_fetch_group + i) % num_groups;
+      if (!group_all_stalled(candidate)) {
+        unsigned s = group_active_sum(candidate);
+        if (s > best_sum) { best_sum = s; best_group = candidate; }
+      }
+    }
+    m_current_fetch_group = best_group;
+  }
+
+  m_next_cycle_prioritized_warps.clear();
+
+  unsigned start = m_current_fetch_group * m_warps_per_group;
+  unsigned end = std::min(num_warps, start + m_warps_per_group);
+  std::vector<shd_warp_t *> cur_group(m_supervised_warps.begin() + start,
+                                      m_supervised_warps.begin() + end);
+  std::sort(cur_group.begin(), cur_group.end(),
+            [&lwm_active_count](shd_warp_t *a, shd_warp_t *b) {
+              return lwm_active_count(a) > lwm_active_count(b);
+            });
+  for (auto *w : cur_group)
+    m_next_cycle_prioritized_warps.push_back(w);
+
+  std::vector<unsigned> other_group_ids;
+  for (unsigned g = 1; g < num_groups; g++)
+    other_group_ids.push_back((m_current_fetch_group + g) % num_groups);
+  std::sort(other_group_ids.begin(), other_group_ids.end(),
+            [&group_active_sum](unsigned a, unsigned b) {
+              return group_active_sum(a) > group_active_sum(b);
+            });
+  for (unsigned group_id : other_group_ids) {
+    unsigned s = group_id * m_warps_per_group;
+    unsigned e = std::min(num_warps, s + m_warps_per_group);
+    std::vector<shd_warp_t *> other_group(m_supervised_warps.begin() + s,
+                                          m_supervised_warps.begin() + e);
+    std::vector<shd_warp_t *> ordered;
+    order_lrr(ordered, other_group, other_group.end(), other_group.size());
+    for (auto *w : ordered)
+      m_next_cycle_prioritized_warps.push_back(w);
+  }
+}
+
+void lwm_two_level_adaptive_scheduler::order_warps() {
+  unsigned num_warps = m_supervised_warps.size();
+  if (num_warps == 0) return;
+
+  unsigned num_groups =
+      (num_warps + m_warps_per_group - 1) / m_warps_per_group;
+
+  auto lwm_active_count = [](shd_warp_t *w) -> unsigned {
+    if (w->done_exit() || w->waiting()) return 0;
+    if (w->ibuffer_next_valid() && w->ibuffer_next_inst())
+      return w->ibuffer_next_inst()->active_count();
+    return MAX_WARP_SIZE;
+  };
+
+  if (group_all_stalled(m_current_fetch_group) ||
+      group_underutilized(m_current_fetch_group)) {
+    unsigned best_group = m_current_fetch_group;
+    unsigned best_sum = group_active_sum(m_current_fetch_group);
+    for (unsigned i = 1; i <= num_groups; i++) {
+      unsigned candidate = (m_current_fetch_group + i) % num_groups;
+      if (!group_all_stalled(candidate)) {
+        unsigned s = group_active_sum(candidate);
+        if (s > best_sum) { best_sum = s; best_group = candidate; }
+      }
+    }
+    m_current_fetch_group = best_group;
+  }
+
+  m_next_cycle_prioritized_warps.clear();
+
+  unsigned start = m_current_fetch_group * m_warps_per_group;
+  unsigned end = std::min(num_warps, start + m_warps_per_group);
+  std::vector<shd_warp_t *> cur_group(m_supervised_warps.begin() + start,
+                                      m_supervised_warps.begin() + end);
+
+  std::vector<shd_warp_t *>::const_iterator last_in_cur = cur_group.end();
+  if (m_last_supervised_issued != m_supervised_warps.end()) {
+    for (auto it = cur_group.begin(); it != cur_group.end(); ++it) {
+      if (*it == *m_last_supervised_issued) { last_in_cur = it; break; }
+    }
+  }
+
+  std::vector<shd_warp_t *> lrr_ordered;
+  order_lrr(lrr_ordered, cur_group, last_in_cur, cur_group.size());
+
+  std::stable_sort(lrr_ordered.begin(), lrr_ordered.end(),
+                   [&lwm_active_count](shd_warp_t *a, shd_warp_t *b) {
+                     return lwm_active_count(a) > lwm_active_count(b);
+                   });
+
+  for (auto *w : lrr_ordered)
+    m_next_cycle_prioritized_warps.push_back(w);
+
+  std::vector<unsigned> other_group_ids;
+  for (unsigned g = 1; g < num_groups; g++)
+    other_group_ids.push_back((m_current_fetch_group + g) % num_groups);
+  std::sort(other_group_ids.begin(), other_group_ids.end(),
+            [this](unsigned a, unsigned b) {
+              return group_active_sum(a) > group_active_sum(b);
+            });
+  for (unsigned group_id : other_group_ids) {
+    unsigned s = group_id * m_warps_per_group;
+    unsigned e = std::min(num_warps, s + m_warps_per_group);
+    std::vector<shd_warp_t *> other_group(m_supervised_warps.begin() + s,
+                                          m_supervised_warps.begin() + e);
+    std::vector<shd_warp_t *> ordered;
+    order_lrr(ordered, other_group, other_group.end(), other_group.size());
+    for (auto *w : ordered)
+      m_next_cycle_prioritized_warps.push_back(w);
+  }
+}
+
+void two_level_gto_scheduler::order_warps() {
+  unsigned num_warps = m_supervised_warps.size();
+  if (num_warps == 0) return;
+
+  unsigned num_groups = (num_warps + m_group_size - 1) / m_group_size;
+
+  if (group_all_stalled(m_current_fetch_group)) {
+    for (unsigned i = 1; i <= num_groups; i++) {
+      unsigned candidate = (m_current_fetch_group + i) % num_groups;
+      if (!group_all_stalled(candidate)) {
+        m_current_fetch_group = candidate;
+        break;
+      }
+    }
+  }
+
+  m_next_cycle_prioritized_warps.clear();
+
+  unsigned start = m_current_fetch_group * m_group_size;
+  unsigned end = std::min(num_warps, start + m_group_size);
+  std::vector<shd_warp_t *> cur_group(m_supervised_warps.begin() + start,
+                                      m_supervised_warps.begin() + end);
+
+  std::vector<shd_warp_t *>::const_iterator last_in_cur = cur_group.end();
+  if (m_last_supervised_issued != m_supervised_warps.end()) {
+    for (auto it = cur_group.begin(); it != cur_group.end(); ++it) {
+      if (*it == *m_last_supervised_issued) { last_in_cur = it; break; }
+    }
+  }
+
+  std::vector<shd_warp_t *> lrr_ordered;
+  order_lrr(lrr_ordered, cur_group, last_in_cur, cur_group.size());
+
+  std::stable_sort(lrr_ordered.begin(), lrr_ordered.end(),
+                   [](shd_warp_t *a, shd_warp_t *b) {
+                     if (a->done_exit() != b->done_exit())
+                       return !a->done_exit();
+                     return a->get_dynamic_warp_id() < b->get_dynamic_warp_id();
+                   });
+
+  for (auto *w : lrr_ordered)
+    m_next_cycle_prioritized_warps.push_back(w);
+
+  for (unsigned g = 1; g < num_groups; g++) {
+    unsigned group_id = (m_current_fetch_group + g) % num_groups;
+    unsigned s = group_id * m_group_size;
+    unsigned e = std::min(num_warps, s + m_group_size);
+    std::vector<shd_warp_t *> other_group(m_supervised_warps.begin() + s,
+                                          m_supervised_warps.begin() + e);
+    std::vector<shd_warp_t *> ordered;
+    order_lrr(ordered, other_group, other_group.end(), other_group.size());
+    for (auto *w : ordered)
+      m_next_cycle_prioritized_warps.push_back(w);
   }
 }
 

@@ -1,3 +1,5 @@
+//testby niraj
+
 // Copyright (c) 2009-2021, Tor M. Aamodt, Wilson W.L. Fung, Andrew Turner,
 // Ali Bakhoda, Vijay Kandiah, Nikos Hardavellas,
 // Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
@@ -369,6 +371,11 @@ enum concrete_scheduler {
   CONCRETE_SCHEDULER_RRR,
   CONCRETE_SCHEDULER_WARP_LIMITING,
   CONCRETE_SCHEDULER_OLDEST_FIRST,
+  CONCRETE_SCHEDULER_TWO_LEVEL_RR,
+  CONCRETE_SCHEDULER_LWM,
+  CONCRETE_SCHEDULER_LWM_TWO_LEVEL,
+  CONCRETE_SCHEDULER_LWM_TWO_LEVEL_ADAPTIVE,
+  CONCRETE_SCHEDULER_TWO_LEVEL_GTO,
   NUM_CONCRETE_SCHEDULERS
 };
 
@@ -612,6 +619,245 @@ class two_level_active_scheduler : public scheduler_unit {
   scheduler_prioritization_type m_inner_level_prioritization;
   scheduler_prioritization_type m_outer_level_prioritization;
   unsigned m_max_active_warps;
+};
+
+class two_level_rr_scheduler : public scheduler_unit {
+ public:
+  two_level_rr_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                         Scoreboard *scoreboard, simt_stack **simt,
+                         std::vector<shd_warp_t *> *warp,
+                         register_set *sp_out, register_set *dp_out,
+                         register_set *sfu_out, register_set *int_out,
+                         register_set *tensor_core_out,
+                         std::vector<register_set *> &spec_cores_out,
+                         register_set *mem_out, int id, char *config_str)
+      : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
+                       sfu_out, int_out, tensor_core_out, spec_cores_out,
+                       mem_out, id),
+        m_current_fetch_group(0),
+        m_fetch_group_size(8) {
+    int ret = sscanf(config_str, "two_level_rr:%d", &m_fetch_group_size);
+    assert(ret == 1);
+  }
+  virtual ~two_level_rr_scheduler() {}
+  virtual void order_warps();
+  virtual void done_adding_supervised_warps() {
+    m_last_supervised_issued = m_supervised_warps.end();
+  }
+
+ private:
+  bool fetch_group_all_stalled(unsigned group_id) {
+    unsigned num_warps = m_supervised_warps.size();
+    unsigned start = group_id * m_fetch_group_size;
+    unsigned end = std::min(num_warps, start + m_fetch_group_size);
+    for (unsigned i = start; i < end; i++) {
+      shd_warp_t *w = m_supervised_warps[i];
+      if (!w->done_exit() && !w->waiting()) return false;
+    }
+    return true;
+  }
+  unsigned m_current_fetch_group;
+  unsigned m_fetch_group_size;
+};
+
+// Large Warp Microarchitecture Scheduler (Narasiman et al. MICRO'11)
+class lwm_scheduler : public scheduler_unit {
+ public:
+  lwm_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                Scoreboard *scoreboard, simt_stack **simt,
+                std::vector<shd_warp_t *> *warp, register_set *sp_out,
+                register_set *dp_out, register_set *sfu_out,
+                register_set *int_out, register_set *tensor_core_out,
+                std::vector<register_set *> &spec_cores_out,
+                register_set *mem_out, int id, char *config_str)
+      : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
+                       sfu_out, int_out, tensor_core_out, spec_cores_out,
+                       mem_out, id),
+        m_large_warp_size(256),
+        m_current_large_warp(0) {
+    int ret = sscanf(config_str, "lwm:%d", &m_large_warp_size);
+    assert(ret == 1);
+    m_warps_per_large_warp = m_large_warp_size / 32;
+  }
+  virtual ~lwm_scheduler() {}
+  virtual void order_warps();
+  virtual void done_adding_supervised_warps() {
+    m_last_supervised_issued = m_supervised_warps.end();
+  }
+
+ private:
+  bool large_warp_all_stalled(unsigned large_warp_id) {
+    unsigned start = large_warp_id * m_warps_per_large_warp;
+    unsigned end = std::min((unsigned)m_supervised_warps.size(),
+                            start + m_warps_per_large_warp);
+    for (unsigned i = start; i < end; i++) {
+      shd_warp_t *w = m_supervised_warps[i];
+      if (!w->done_exit() && !w->waiting()) return false;
+    }
+    return true;
+  }
+  unsigned count_active_threads(unsigned large_warp_id) {
+    unsigned start = large_warp_id * m_warps_per_large_warp;
+    unsigned end = std::min((unsigned)m_supervised_warps.size(),
+                            start + m_warps_per_large_warp);
+    unsigned count = 0;
+    for (unsigned i = start; i < end; i++) {
+      shd_warp_t *w = m_supervised_warps[i];
+      if (!w->done_exit()) count += (32 - w->get_n_completed());
+    }
+    return count;
+  }
+  unsigned m_large_warp_size;
+  unsigned m_warps_per_large_warp;
+  unsigned m_current_large_warp;
+};
+
+// Combined LWM + Two-Level Round-Robin Scheduler
+class lwm_two_level_scheduler : public scheduler_unit {
+ public:
+  lwm_two_level_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                          Scoreboard *scoreboard, simt_stack **simt,
+                          std::vector<shd_warp_t *> *warp, register_set *sp_out,
+                          register_set *dp_out, register_set *sfu_out,
+                          register_set *int_out, register_set *tensor_core_out,
+                          std::vector<register_set *> &spec_cores_out,
+                          register_set *mem_out, int id, char *config_str)
+      : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
+                       sfu_out, int_out, tensor_core_out, spec_cores_out,
+                       mem_out, id),
+        m_large_warp_size(256),
+        m_warps_per_group(8),
+        m_current_fetch_group(0) {
+    int ret = sscanf(config_str, "lwm_two_level:%d", &m_large_warp_size);
+    assert(ret == 1);
+    m_warps_per_group = m_large_warp_size / 32;
+  }
+  virtual ~lwm_two_level_scheduler() {}
+  virtual void order_warps();
+  virtual void done_adding_supervised_warps() {
+    m_last_supervised_issued = m_supervised_warps.end();
+  }
+
+ private:
+  bool group_all_stalled(unsigned group_id) {
+    unsigned num_warps = m_supervised_warps.size();
+    unsigned start = group_id * m_warps_per_group;
+    unsigned end = std::min(num_warps, start + m_warps_per_group);
+    for (unsigned i = start; i < end; i++) {
+      shd_warp_t *w = m_supervised_warps[i];
+      if (!w->done_exit() && !w->waiting()) return false;
+    }
+    return true;
+  }
+  unsigned m_large_warp_size;
+  unsigned m_warps_per_group;
+  unsigned m_current_fetch_group;
+};
+
+// LWM Two-Level Adaptive Scheduler
+class lwm_two_level_adaptive_scheduler : public scheduler_unit {
+ public:
+  lwm_two_level_adaptive_scheduler(
+      shader_core_stats *stats, shader_core_ctx *shader,
+      Scoreboard *scoreboard, simt_stack **simt,
+      std::vector<shd_warp_t *> *warp, register_set *sp_out,
+      register_set *dp_out, register_set *sfu_out, register_set *int_out,
+      register_set *tensor_core_out,
+      std::vector<register_set *> &spec_cores_out,
+      register_set *mem_out, int id, char *config_str)
+      : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
+                       sfu_out, int_out, tensor_core_out, spec_cores_out,
+                       mem_out, id),
+        m_large_warp_size(256),
+        m_warps_per_group(8),
+        m_current_fetch_group(0) {
+    int ret = sscanf(config_str, "lwm_two_level_adaptive:%d", &m_large_warp_size);
+    assert(ret == 1);
+    m_warps_per_group = m_large_warp_size / 32;
+  }
+  virtual ~lwm_two_level_adaptive_scheduler() {}
+  virtual void order_warps();
+  virtual void done_adding_supervised_warps() {
+    m_last_supervised_issued = m_supervised_warps.end();
+  }
+
+ private:
+  unsigned group_active_sum(unsigned group_id) {
+    unsigned start = group_id * m_warps_per_group;
+    unsigned end = std::min((unsigned)m_supervised_warps.size(),
+                            start + m_warps_per_group);
+    unsigned sum = 0;
+    for (unsigned i = start; i < end; i++) {
+      shd_warp_t *w = m_supervised_warps[i];
+      if (w->done_exit() || w->waiting()) continue;
+      if (w->ibuffer_next_valid() && w->ibuffer_next_inst())
+        sum += w->ibuffer_next_inst()->active_count();
+      else
+        sum += MAX_WARP_SIZE;
+    }
+    return sum;
+  }
+  bool group_underutilized(unsigned group_id) {
+    unsigned start = group_id * m_warps_per_group;
+    unsigned end = std::min((unsigned)m_supervised_warps.size(),
+                            start + m_warps_per_group);
+    unsigned max_possible = (end - start) * MAX_WARP_SIZE;
+    return group_active_sum(group_id) < max_possible / 2;
+  }
+  bool group_all_stalled(unsigned group_id) {
+    unsigned start = group_id * m_warps_per_group;
+    unsigned end = std::min((unsigned)m_supervised_warps.size(),
+                            start + m_warps_per_group);
+    for (unsigned i = start; i < end; i++) {
+      shd_warp_t *w = m_supervised_warps[i];
+      if (!w->done_exit() && !w->waiting()) return false;
+    }
+    return true;
+  }
+  unsigned m_large_warp_size;
+  unsigned m_warps_per_group;
+  unsigned m_current_fetch_group;
+};
+
+// Two-Level GTO Scheduler
+// Outer level: switch fetch groups when current group is all stalled
+// Inner level: order_lrr base + stable_sort by oldest dynamic warp ID (GTO)
+class two_level_gto_scheduler : public scheduler_unit {
+ public:
+  two_level_gto_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                          Scoreboard *scoreboard, simt_stack **simt,
+                          std::vector<shd_warp_t *> *warp, register_set *sp_out,
+                          register_set *dp_out, register_set *sfu_out,
+                          register_set *int_out, register_set *tensor_core_out,
+                          std::vector<register_set *> &spec_cores_out,
+                          register_set *mem_out, int id, char *config_str)
+      : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
+                       sfu_out, int_out, tensor_core_out, spec_cores_out,
+                       mem_out, id),
+        m_group_size(8),
+        m_current_fetch_group(0) {
+    int ret = sscanf(config_str, "two_level_gto:%d", &m_group_size);
+    assert(ret == 1);
+  }
+  virtual ~two_level_gto_scheduler() {}
+  virtual void order_warps();
+  virtual void done_adding_supervised_warps() {
+    m_last_supervised_issued = m_supervised_warps.end();
+  }
+
+ private:
+  bool group_all_stalled(unsigned group_id) {
+    unsigned num_warps = m_supervised_warps.size();
+    unsigned start = group_id * m_group_size;
+    unsigned end = std::min(num_warps, start + m_group_size);
+    for (unsigned i = start; i < end; i++) {
+      shd_warp_t *w = m_supervised_warps[i];
+      if (!w->done_exit() && !w->waiting()) return false;
+    }
+    return true;
+  }
+  unsigned m_group_size;
+  unsigned m_current_fetch_group;
 };
 
 // Static Warp Limiting Scheduler
@@ -2024,6 +2270,10 @@ class shader_core_stats : public shader_core_stats_pod {
   friend class scheduler_unit;
   friend class TwoLevelScheduler;
   friend class LooseRoundRobbinScheduler;
+  friend class lwm_scheduler;
+  friend class lwm_two_level_scheduler;
+  friend class lwm_two_level_adaptive_scheduler;
+  friend class two_level_gto_scheduler;
 };
 
 class memory_config;
@@ -2449,6 +2699,10 @@ class shader_core_ctx : public core_t {
   friend class scheduler_unit;  // this is needed to use private issue warp.
   friend class TwoLevelScheduler;
   friend class LooseRoundRobbinScheduler;
+  friend class lwm_scheduler;
+  friend class lwm_two_level_scheduler;
+  friend class lwm_two_level_adaptive_scheduler;
+  friend class two_level_gto_scheduler;
   virtual void issue_warp(register_set &warp, const warp_inst_t *pI,
                           const active_mask_t &active_mask, unsigned warp_id,
                           unsigned sch_id);
