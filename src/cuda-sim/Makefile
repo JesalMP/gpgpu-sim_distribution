@@ -73,7 +73,6 @@ $(OUTPUT_DIR)/Makefile.makedepend: depend
 
 depend:
 	touch $(OUTPUT_DIR)/Makefile.makedepend
-	makedepend -f$(OUTPUT_DIR)/Makefile.makedepend -p$(OUTPUT_DIR)/ $(SRCS) 2> /dev/null
 
 libgpgpu_ptx_sim.a: $(OBJS) 
 	ar rcs $(OUTPUT_DIR)/libgpgpu_ptx_sim.a $(OUTPUT_DIR)/ptx.tab.o $(OUTPUT_DIR)/lex.ptx_.o $(OUTPUT_DIR)/ptxinfo.tab.o $(OUTPUT_DIR)/lex.ptxinfo_.o $(OBJS)

@@ -79,7 +79,6 @@ $(OUTPUT_DIR)/Makefile.makedepend: depend
 
 depend:
 	touch $(OUTPUT_DIR)/Makefile.makedepend
-	makedepend -f$(OUTPUT_DIR)/Makefile.makedepend $(SRCS) 2> /dev/null
 
 clean:
 	rm -f lex.ptx_.c ptx.tab.c ptx.tab.h ptx.output

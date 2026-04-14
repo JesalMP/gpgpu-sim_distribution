@@ -102,7 +102,6 @@ $(OUTPUT_DIR)/Makefile.makedepend: depend
 
 depend:
 	touch $(OUTPUT_DIR)/Makefile.makedepend
-	makedepend -f$(OUTPUT_DIR)/Makefile.makedepend -p$(OUTPUT_DIR)/ $(CXX_SRCS) 2> /dev/null
 
 $(OUTPUT_DIR)/nvopencl_wrapper: nvopencl_wrapper.cc
 	if [ ! -d bin ]; then mkdir bin; fi

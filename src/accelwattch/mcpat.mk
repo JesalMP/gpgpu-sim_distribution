@@ -95,7 +95,6 @@ $(OUTPUT_DIR)/Makefile.makedepend: depend
 
 depend:
 	touch $(OUTPUT_DIR)/Makefile.makedepend
-	makedepend -f$(OUTPUT_DIR)/Makefile.makedepend -p$(OUTPUT_DIR)/ $(SRCS) 2> /dev/null
 	$(MAKE) -C ./cacti/ depend
 
 clean:

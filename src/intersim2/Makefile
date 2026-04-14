@@ -133,7 +133,6 @@ ALL_SRCS += $(shell ls **/*.cpp)
 
 depend:
 	touch $(OBJDIR)/Makefile.makedepend
-	makedepend -f$(OBJDIR)/Makefile.makedepend -I$(INCPATH) -p$(OBJDIR)/ $(ALL_SRCS) 2> /dev/null
 
 ${LEX_OBJS}: $(OBJDIR)/lex.yy.c $(OBJDIR)/y.tab.h
 	$(CC) -Wno-unused-function $(CPPFLAGS) -c $< -o $@

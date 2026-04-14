@@ -72,7 +72,6 @@ $(OUTPUT_DIR)/Makefile.makedepend: depend
 
 depend:
 	touch $(OUTPUT_DIR)/Makefile.makedepend
-	makedepend -f$(OUTPUT_DIR)/Makefile.makedepend -p$(OUTPUT_DIR)/ $(SRCS) 2> /dev/null
 
 clean:
 	rm -f *.o core *~ *.a Makefile.makedepend Makefile.makedepend.bak
