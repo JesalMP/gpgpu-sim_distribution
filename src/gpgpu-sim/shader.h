@@ -3015,7 +3015,8 @@ class shader_memory_interface : public mem_fetch_interface {
     return m_cluster->icnt_injection_buffer_full(size, write);
   }
   virtual void push(mem_fetch *mf) {
-    m_core->inc_simt_to_mem(mf->get_num_flits(true));
+    // Note: inc_simt_to_mem is called inside icnt_inject_request_packet
+    // after the ICC merge check, so merged packets are not counted.
     m_cluster->icnt_inject_request_packet(mf);
   }
 

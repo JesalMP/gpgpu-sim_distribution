@@ -5004,6 +5004,8 @@ void simt_core_cluster::icnt_inject_request_packet(class mem_fetch *mf) {
   }
   // Original injection path (unchanged)
   update_icnt_stats(mf);
+  // Count flit here (after ICC check) so merged packets don't inflate stat
+  m_stats->n_simt_to_mem[mf->get_sid()] += mf->get_num_flits(true);
   unsigned int packet_size = mf->get_ctrl_size();  // reads: ctrl only
   m_stats->m_outgoing_traffic_stats->record_traffic(mf, packet_size);
   unsigned destination = mf->get_sub_partition_id();
